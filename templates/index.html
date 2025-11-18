@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Simulador Ambulancias Pro - Popayán</title>
+    <meta charset="utf-8">
+
+    <!-- Leaflet -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <!-- Socket.IO -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.js"></script>
+
+    <style>
+        #map {
+            width: 100%;
+            height: 92vh;
+        }
+    </style>
+</head>
+<body>
+
+<h2>Simulador Profesional de Ambulancias – Popayán</h2>
+
+<div id="map"></div>
+
+<!-- Datos enviados desde Flask -->
+<script>
+    window.DATA = {
+        ambulancias: JSON.parse(`{{ ambulancias | tojson | safe }}`),
+        hospitales: JSON.parse(`{{ hospitales | tojson | safe }}`)
+    };
+</script>
+
+<!-- Archivo JS con el mapa -->
+<script src="/static/mapa.js"></script>
+
+</body>
+</html>
