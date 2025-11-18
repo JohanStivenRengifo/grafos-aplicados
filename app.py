@@ -1,27 +1,292 @@
-from flask import Flask, render_template
-from flask_socketio import SocketIO
-from clases import Nodo, Hospital, Ruta, Ambulancia
-import requests, threading, time, random, datetime
+import sys
+import hashlib
+from collections import OrderedDict
+
+try:
+    from flask import Flask, render_template, Response
+    from flask_socketio import SocketIO
+    from clases import Nodo, Hospital, Ruta, Ambulancia, Via
+    import requests
+    import threading
+    import time
+    import random
+    import math
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+except ImportError as e:
+    print(f"Error: Faltan dependencias. Ejecuta: pip install flask flask-socketio requests")
+    sys.exit(1)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # ----- CONFIGURACIÓN INICIAL -----
 hospitales = [
-    Hospital("San José", 2.441981, -76.612537, tiempo_espera=5, especialidades=["Cardiología"]),
-    Hospital("La Estancia", 2.451490, -76.623228, tiempo_espera=3, especialidades=["Trauma"]),
-    Hospital("Susana López", 2.455510, -76.619900, tiempo_espera=4, especialidades=["Pediatría"]),
-    Hospital("Santa Gracia", 2.448185, -76.610145, tiempo_espera=6, especialidades=["General"])
+    Hospital("Hospital Universitario San José", 2.4526403, -76.600117, tiempo_espera=3, especialidades=["Cardiología", "Trauma"], capacidad_max=25, pacientes_actuales=random.randint(0, 18)),
+    Hospital("Hospital Susana López de Valencia", 2.43728, -76.6193, tiempo_espera=4, especialidades=["Pediatría", "Ginecología"], capacidad_max=20, pacientes_actuales=random.randint(0, 15)),
+    Hospital("Hospital Toribio Maya", 2.48527, -76.6, tiempo_espera=3, especialidades=["General", "Urgencias"], capacidad_max=22, pacientes_actuales=random.randint(0, 16)),
+    Hospital("Clínica Santa Gracia", 2.4595, -76.603, tiempo_espera=4, especialidades=["General", "Urgencias"], capacidad_max=18, pacientes_actuales=random.randint(0, 12)),
+    Hospital("Clínica San Rafael", 2.4515, -76.6232, tiempo_espera=6, especialidades=["Trauma", "Cirugía"], capacidad_max=15, pacientes_actuales=random.randint(0, 10)),
+    Hospital("Hospital María Occidente", 2.4285, -76.635, tiempo_espera=5, especialidades=["General", "Urgencias"], capacidad_max=20, pacientes_actuales=random.randint(0, 14))
 ]
+
+colores = ["green", "orange", "red", "purple", "blue", "yellow"]
+
+def generar_ubicacion_aleatoria():
+    lat_base = 2.4448
+    lon_base = -76.6147
+    radio = 0.01
+    lat = lat_base + random.uniform(-radio, radio)
+    lon = lon_base + random.uniform(-radio, radio)
+    return lat, lon
 
 ambulancias = [
-    Ambulancia("A1", 2.4448, -76.6147, especialidad="Cardiología"),
-    Ambulancia("A2", 2.4490, -76.6150, especialidad="Trauma"),
-    Ambulancia("A3", 2.4460, -76.6120, especialidad="General")
+    Ambulancia("AMB-001", *generar_ubicacion_aleatoria(), especialidad="Cardiología"),
+    Ambulancia("AMB-002", *generar_ubicacion_aleatoria(), especialidad="Trauma"),
+    Ambulancia("AMB-003", *generar_ubicacion_aleatoria(), especialidad="General")
 ]
 
-colores = ["green", "orange", "red", "purple"]
+# ----- CACHÉ DE RUTAS -----
+CACHE_RUTAS = OrderedDict()
+MAX_CACHE_SIZE = 500
+CACHE_TTL = 300
+
+def _generar_clave_cache(origen, destino):
+    coords = f"{origen.lat:.6f},{origen.lon:.6f};{destino.lat:.6f},{destino.lon:.6f}"
+    return hashlib.md5(coords.encode()).hexdigest()
+
+def _obtener_de_cache(origen, destino):
+    clave = _generar_clave_cache(origen, destino)
+    if clave in CACHE_RUTAS:
+        resultado, timestamp = CACHE_RUTAS[clave]
+        if time.time() - timestamp < CACHE_TTL:
+            CACHE_RUTAS.move_to_end(clave)
+            return resultado
+        del CACHE_RUTAS[clave]
+    return None
+
+def _guardar_en_cache(origen, destino, resultado):
+    clave = _generar_clave_cache(origen, destino)
+    if len(CACHE_RUTAS) >= MAX_CACHE_SIZE:
+        CACHE_RUTAS.popitem(last=False)
+    CACHE_RUTAS[clave] = (resultado, time.time())
+
+# ----- FUNCIONES AUXILIARES -----
+def calcular_distancia_km(nodo1, nodo2):
+    R = 6371
+    lat1, lon1 = math.radians(nodo1.lat), math.radians(nodo1.lon)
+    lat2, lon2 = math.radians(nodo2.lat), math.radians(nodo2.lon)
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+def obtener_ruta_graphhopper(origen, destino, max_retries=2):
+    for intento in range(max_retries):
+        try:
+            url = "https://graphhopper.com/api/1/route"
+            params = [
+                ('point', f"{origen.lat},{origen.lon}"),
+                ('point', f"{destino.lat},{destino.lon}"),
+                ('vehicle', 'car'),
+                ('key', 'demo'),
+                ('points_encoded', 'false'),
+                ('instructions', 'false')
+            ]
+            timeout = 15 + (intento * 5)
+            response = requests.get(url, params=params, timeout=timeout)
+            
+            if response.status_code != 200:
+                if intento < max_retries - 1:
+                    time.sleep(0.5 * (2 ** intento))
+                    continue
+                return None, None, None
+            
+            r = response.json()
+            if r.get("info", {}).get("statuscode") != 0 or not r.get("paths"):
+                return None, None, None
+            
+            path = r["paths"][0]
+            points = path.get("points")
+            if not points:
+                return None, None, None
+            
+            coords = points.get("coordinates", []) if isinstance(points, dict) else points
+            if not coords or len(coords) < 2:
+                return None, None, None
+            
+            nodos_ruta = [[float(c[1]), float(c[0])] for c in coords]
+            distancia_km = float(path.get("distance", 0)) / 1000
+            tiempo_min = float(path.get("time", 0)) / 1000 / 60
+            
+            if tiempo_min <= 0 or len(nodos_ruta) < 2:
+                return None, None, None
+            
+            return nodos_ruta, distancia_km, tiempo_min
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if intento < max_retries - 1:
+                time.sleep(0.5 * (2 ** intento))
+                continue
+        except Exception:
+            pass
+    return None, None, None
+
+def obtener_ruta_openrouteservice(origen, destino, max_retries=2):
+    for intento in range(max_retries):
+        try:
+            api_key = "5b3ce3597851110001cf6248a1b7c8d4c8b84f8b9b8f8f8f8f8f8f8f8f8f8"
+            url = "https://api.openrouteservice.org/v2/directions/driving-car"
+            headers = {
+                'Accept': 'application/json, application/geo+json',
+                'Authorization': api_key,
+                'Content-Type': 'application/json'
+            }
+            body = {
+                "coordinates": [[origen.lon, origen.lat], [destino.lon, destino.lat]],
+                "geometry": True,
+                "geometry_simplify": False
+            }
+            timeout = 15 + (intento * 5)
+            response = requests.post(url, json=body, headers=headers, timeout=timeout)
+            
+            if response.status_code != 200:
+                if intento < max_retries - 1:
+                    time.sleep(0.5 * (2 ** intento))
+                    continue
+                return None, None, None
+            
+            r = response.json()
+            if not r.get("features"):
+                return None, None, None
+            
+            feature = r["features"][0]
+            coords = feature.get("geometry", {}).get("coordinates", [])
+            if not coords or len(coords) < 2:
+                return None, None, None
+            
+            nodos_ruta = [[float(c[1]), float(c[0])] for c in coords]
+            summary = feature.get("properties", {}).get("summary", {})
+            distancia_km = float(summary.get("distance", 0)) / 1000
+            tiempo_min = float(summary.get("duration", 0)) / 60
+            
+            if tiempo_min <= 0:
+                return None, None, None
+            
+            return nodos_ruta, distancia_km, tiempo_min
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if intento < max_retries - 1:
+                time.sleep(0.5 * (2 ** intento))
+                continue
+        except Exception:
+            pass
+    return None, None, None
+
+def obtener_ruta_osrm(origen, destino, max_retries=1):
+    for intento in range(max_retries):
+        try:
+            url = f"https://router.project-osrm.org/route/v1/driving/{origen.lon},{origen.lat};{destino.lon},{destino.lat}"
+            params = {
+                'overview': 'full',
+                'geometries': 'geojson',
+                'alternatives': 'false',
+                'steps': 'false'
+            }
+            timeout = 8 + (intento * 3)
+            response = requests.get(
+                url, 
+                params=params, 
+                timeout=timeout, 
+                headers={'User-Agent': 'Mozilla/5.0'},
+                allow_redirects=True
+            )
+            
+            if response.status_code != 200:
+                return None, None, None
+            
+            r = response.json()
+            if r.get("code") != "Ok" or not r.get("routes"):
+                return None, None, None
+            
+            route = r["routes"][0]
+            geometry = route.get("geometry")
+            if not geometry:
+                return None, None, None
+            
+            coords = geometry.get("coordinates", []) if isinstance(geometry, dict) else geometry
+            if not coords or len(coords) < 2:
+                return None, None, None
+            
+            nodos_ruta = [[float(c[1]), float(c[0])] for c in coords]
+            distancia_km = float(route.get("distance", 0)) / 1000
+            tiempo_min = float(route.get("duration", 0)) / 60
+            
+            if tiempo_min <= 0 or len(nodos_ruta) < 2:
+                return None, None, None
+            
+            return nodos_ruta, distancia_km, tiempo_min
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            return None, None, None
+        except Exception:
+            return None, None, None
+    return None, None, None
+
+def obtener_ruta_real(origen, destino):
+    resultado_cache = _obtener_de_cache(origen, destino)
+    if resultado_cache:
+        return resultado_cache
+    
+    servicios = [
+        obtener_ruta_openrouteservice,
+        obtener_ruta_graphhopper,
+        obtener_ruta_osrm
+    ]
+    
+    for servicio in servicios:
+        nodos_ruta, distancia, tiempo = servicio(origen, destino)
+        if nodos_ruta and len(nodos_ruta) > 2:
+            resultado = (nodos_ruta, distancia, tiempo)
+            _guardar_en_cache(origen, destino, resultado)
+            return resultado
+    
+    return None, None, None
+
+def calcular_costo_ruta(amb, h, nodos_ruta, tiempo_base):
+    if nodos_ruta and len(nodos_ruta) >= 2 and tiempo_base is not None and tiempo_base > 0:
+        match_especialidad = 1.0 if amb.especialidad in h.especialidades else 0.5
+        penalizacion_ocupacion = h.porcentaje_ocupacion() * 5
+        penalizacion_espera = h.tiempo_espera
+        trafico = random.uniform(0, 0.5)
+        tiempo_con_trafico = tiempo_base * (1 + trafico * 2)
+        return tiempo_con_trafico + penalizacion_espera + penalizacion_ocupacion + (1 - match_especialidad) * 3
+    return None
+
+def evaluar_hospital(amb, h):
+    try:
+        nodos_ruta, distancia_real, tiempo_base = obtener_ruta_real(amb.pos, Nodo(h.lat, h.lon))
+        
+        if nodos_ruta and len(nodos_ruta) > 2 and tiempo_base is not None and tiempo_base > 0:
+            costo = calcular_costo_ruta(amb, h, nodos_ruta, tiempo_base)
+            if costo is not None and costo > 0:
+                return (h, nodos_ruta, costo)
+        
+        distancia_directa = calcular_distancia_km(amb.pos, Nodo(h.lat, h.lon))
+        tiempo_estimado = (distancia_directa / 60) * 60
+        match_especialidad = 1.0 if amb.especialidad in h.especialidades else 0.5
+        penalizacion_ocupacion = h.porcentaje_ocupacion() * 5
+        penalizacion_espera = h.tiempo_espera
+        costo = tiempo_estimado + penalizacion_espera + penalizacion_ocupacion + (1 - match_especialidad) * 3
+        nodos_ruta = [[amb.pos.lat, amb.pos.lon], [h.lat, h.lon]]
+        
+        return (h, nodos_ruta, costo)
+    except:
+        distancia_directa = calcular_distancia_km(amb.pos, Nodo(h.lat, h.lon))
+        tiempo_estimado = (distancia_directa / 60) * 60
+        match_especialidad = 1.0 if amb.especialidad in h.especialidades else 0.5
+        penalizacion_ocupacion = h.porcentaje_ocupacion() * 5
+        penalizacion_espera = h.tiempo_espera
+        costo = tiempo_estimado + penalizacion_espera + penalizacion_ocupacion + (1 - match_especialidad) * 3
+        nodos_ruta = [[amb.pos.lat, amb.pos.lon], [h.lat, h.lon]]
+        return (h, nodos_ruta, costo)
 
 # ----- CONVERSORES A JSON -----
 def ambulancia_to_dict(a):
@@ -38,111 +303,150 @@ def hospital_to_dict(h):
         "lat": h.lat,
         "lon": h.lon,
         "espera": h.tiempo_espera,
-        "especialidades": h.especialidades
+        "especialidades": h.especialidades,
+        "capacidad_max": h.capacidad_max,
+        "pacientes_actuales": h.pacientes_actuales,
+        "puede_recibir": h.puede_recibir(),
+        "porcentaje_ocupacion": round(h.porcentaje_ocupacion() * 100, 1)
     }
 
-# ----- MAPEO DE RUTAS (OSRM) -----
-def obtener_ruta_osrm(origen, destino):
-    url = f"http://router.project-osrm.org/route/v1/driving/{origen.lon},{origen.lat};{destino.lon},{destino.lat}?overview=full&geometries=geojson"
-
-    r = requests.get(url).json()
-    coords = r["routes"][0]["geometry"]["coordinates"]  # [lon, lat]
-    nodos = [[c[1], c[0]] for c in coords]
-
-    tiempo_min = r["routes"][0]["duration"] / 60
-    return Ruta(nodos, tiempo_min)
-
-# ----- ASIGNACIÓN GLOBAL -----
-def asignar_hospitales_global(ambulancias, hospitales):
+# ----- ASIGNACIÓN CON RUTAS REALES -----
+def asignar_hospitales_dijkstra(ambulancias, hospitales):
     asignaciones = {}
-    alpha = 1.0
-    beta = 5.0
-    ocupados = set()
-
+    hospitales_usados = set()
+    
     for amb in ambulancias:
-        mejor_costo = float('inf')
+        hospitales_disponibles = [h for h in hospitales if h.puede_recibir() and h.nombre not in hospitales_usados]
+        if not hospitales_disponibles:
+            hospitales_disponibles = [h for h in hospitales if h.puede_recibir()]
+        
+        if not hospitales_disponibles:
+            continue
+        
         mejor_h = None
-        mejor_ruta = None
-
-        for h in hospitales:
-            if h.nombre in ocupados:
-                continue
-
-            try:
-                ruta = obtener_ruta_osrm(amb.pos, Nodo(h.lat, h.lon))
-            except:
-                distancia = ((amb.pos.lat - h.lat)**2 + (amb.pos.lon - h.lon)**2)**0.5
-                ruta = Ruta([[amb.pos.lat, amb.pos.lon], [h.lat, h.lon]], distancia * 60)
-
-            match = 1.0 if amb.especialidad in h.especialidades else 0.0
-            penalizacion = random.uniform(0, 3)
-
-            costo_total = ruta.tiempo_total + alpha*h.tiempo_espera + beta*(1-match) + penalizacion
-
-            if costo_total < mejor_costo:
-                mejor_costo = costo_total
-                mejor_h = h
-                mejor_ruta = ruta
-
-        if mejor_h:
-            asignaciones[amb.id] = (mejor_h, mejor_ruta, round(mejor_costo, 1))
-            ocupados.add(mejor_h.nombre)
-
+        mejor_costo = float('inf')
+        mejor_ruta_nodos = None
+        
+        with ThreadPoolExecutor(max_workers=min(len(hospitales_disponibles), 6)) as executor:
+            futures = {executor.submit(evaluar_hospital, amb, h): h for h in hospitales_disponibles}
+            
+            for future in as_completed(futures):
+                try:
+                    h, nodos_ruta, costo = future.result()
+                    if nodos_ruta and len(nodos_ruta) >= 2 and costo is not None and costo < mejor_costo:
+                        mejor_costo = costo
+                        mejor_h = h
+                        mejor_ruta_nodos = nodos_ruta
+                except:
+                    continue
+        
+        if mejor_h and mejor_ruta_nodos and len(mejor_ruta_nodos) >= 2:
+            ruta = Ruta(mejor_ruta_nodos, round(mejor_costo, 1))
+            asignaciones[amb.id] = (mejor_h, ruta, round(mejor_costo, 1))
+            hospitales_usados.add(mejor_h.nombre)
+    
     return asignaciones
 
-# ----- FLASK ROUTE -----
+# ----- FLASK ROUTES -----
+@app.route('/favicon.ico')
+def favicon():
+    return Response(status=204)
+
 @app.route('/')
 def index():
+    global ambulancias
+    ambulancias = [
+        Ambulancia("AMB-001", *generar_ubicacion_aleatoria(), especialidad="Cardiología"),
+        Ambulancia("AMB-002", *generar_ubicacion_aleatoria(), especialidad="Trauma"),
+        Ambulancia("AMB-003", *generar_ubicacion_aleatoria(), especialidad="General")
+    ]
+    
     amb_json = [ambulancia_to_dict(a) for a in ambulancias]
     hosp_json = [hospital_to_dict(h) for h in hospitales]
-
+    
     return render_template("index.html",
                            ambulancias=amb_json,
                            hospitales=hosp_json)
 
 # ----- SIMULACIÓN -----
+def actualizar_estado_hospitales():
+    for h in hospitales:
+        h.tiempo_espera = random.randint(2, 8)
+        h.pacientes_actuales = random.randint(0, int(h.capacidad_max * 0.8))
+
 def simular_ambulancia(amb):
     while True:
+        try:
+            actualizar_estado_hospitales()
+            
+            asignaciones = asignar_hospitales_dijkstra(ambulancias, hospitales)
+            rutas_info = []
+            grafo_info = []
 
-        for h in hospitales:
-            h.tiempo_espera = random.randint(2, 6)
-
-        asignaciones = asignar_hospitales_global(ambulancias, hospitales)
-        rutas_info = []
-
-        for amb_id, (h, ruta, costo) in asignaciones.items():
-
-            rutas_info.append({
-                "ambulancia": amb_id,
-                "hospital": h.nombre,
-                "color": colores[hash(amb_id) % len(colores)],
-                "nodos": ruta.nodos,
-                "tiempo_total": costo
-            })
-
-        socketio.emit("update_rutas", rutas_info)
-
-        if amb.id in asignaciones:
-            h, ruta, _ = asignaciones[amb.id]
-
-            for nodo in ruta.nodos:
-                amb.pos.lat, amb.pos.lon = nodo
-
-                socketio.emit("update_position", {
-                    "ambulancia": amb.id,
-                    "lat": amb.pos.lat,
-                    "lon": amb.pos.lon,
-                    "hospital": h.nombre
+            for amb_id, (h, ruta, costo) in asignaciones.items():
+                if not ruta or not ruta.nodos or len(ruta.nodos) < 2:
+                    continue
+                    
+                color = colores[hash(amb_id) % len(colores)]
+                rutas_info.append({
+                    "ambulancia": amb_id,
+                    "hospital": h.nombre,
+                    "color": color,
+                    "nodos": ruta.nodos,
+                    "tiempo_total": costo
                 })
+                
+                origen_amb = next((a for a in ambulancias if a.id == amb_id), None)
+                if origen_amb and ruta.nodos and len(ruta.nodos) >= 2:
+                    grafo_info.append({
+                        "origen": {"lat": origen_amb.pos.lat, "lon": origen_amb.pos.lon, "id": amb_id},
+                        "destino": {"lat": h.lat, "lon": h.lon, "id": h.nombre},
+                        "ruta": ruta.nodos,
+                        "color": color
+                    })
 
-                time.sleep(2)
+            if rutas_info:
+                socketio.emit("update_rutas", rutas_info)
+            if grafo_info:
+                socketio.emit("update_grafo", grafo_info)
+            
+            if amb.id in asignaciones:
+                h, ruta, _ = asignaciones[amb.id]
+                
+                if ruta and ruta.nodos and len(ruta.nodos) >= 2:
+                    paso = max(1, len(ruta.nodos) // 15)
+                    for i in range(0, len(ruta.nodos), paso):
+                        nodo = ruta.nodos[i]
+                        amb.pos.lat, amb.pos.lon = nodo[0], nodo[1]
+                        
+                        socketio.emit("update_position", {
+                            "ambulancia": amb.id,
+                            "lat": amb.pos.lat,
+                            "lon": amb.pos.lon,
+                            "hospital": h.nombre
+                        })
+                        
+                        time.sleep(0.2)
+            
+            time.sleep(3)
+        except KeyboardInterrupt:
+            break
+        except:
+            time.sleep(5)
 
-        time.sleep(3)
-
-# ----- INICIAR HILOS -----
-for amb in ambulancias:
-    threading.Thread(target=simular_ambulancia, args=(amb,), daemon=True).start()
+def iniciar_simulacion():
+    time.sleep(2)
+    for amb in ambulancias:
+        thread = threading.Thread(target=simular_ambulancia, args=(amb,), daemon=True)
+        thread.start()
 
 # ----- EJECUCIÓN -----
 if __name__ == '__main__':
-    socketio.run(app, debug=True)
+    try:
+        threading.Thread(target=iniciar_simulacion, daemon=True).start()
+        socketio.run(app, debug=False, host='127.0.0.1', port=5000, allow_unsafe_werkzeug=True)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
