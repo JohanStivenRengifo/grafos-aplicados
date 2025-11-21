@@ -233,7 +233,10 @@ def obtener_ruta_osrm(origen, destino, max_retries=1):
 def obtener_ruta_real(origen, destino):
     resultado_cache = _obtener_de_cache(origen, destino)
     if resultado_cache:
-        return resultado_cache
+        nodos_ruta, distancia, tiempo = resultado_cache
+        # Verificar que el caché tenga una ruta válida con más de 2 nodos
+        if nodos_ruta and len(nodos_ruta) > 2:
+            return resultado_cache
     
     servicios = [
         obtener_ruta_openrouteservice,
@@ -241,12 +244,17 @@ def obtener_ruta_real(origen, destino):
         obtener_ruta_osrm
     ]
     
+    # Intentar cada servicio hasta obtener una ruta válida con más de 2 nodos
     for servicio in servicios:
-        nodos_ruta, distancia, tiempo = servicio(origen, destino)
-        if nodos_ruta and len(nodos_ruta) > 2:
-            resultado = (nodos_ruta, distancia, tiempo)
-            _guardar_en_cache(origen, destino, resultado)
-            return resultado
+        try:
+            nodos_ruta, distancia, tiempo = servicio(origen, destino)
+            # Solo aceptar rutas con más de 2 nodos (rutas reales que siguen carreteras)
+            if nodos_ruta and len(nodos_ruta) > 2 and tiempo is not None and tiempo > 0:
+                resultado = (nodos_ruta, distancia, tiempo)
+                _guardar_en_cache(origen, destino, resultado)
+                return resultado
+        except Exception:
+            continue
     
     return None, None, None
 
@@ -261,32 +269,50 @@ def calcular_costo_ruta(amb, h, nodos_ruta, tiempo_base):
     return None
 
 def evaluar_hospital(amb, h):
-    try:
-        nodos_ruta, distancia_real, tiempo_base = obtener_ruta_real(amb.pos, Nodo(h.lat, h.lon))
-        
-        if nodos_ruta and len(nodos_ruta) > 2 and tiempo_base is not None and tiempo_base > 0:
-            costo = calcular_costo_ruta(amb, h, nodos_ruta, tiempo_base)
-            if costo is not None and costo > 0:
-                return (h, nodos_ruta, costo)
-        
-        distancia_directa = calcular_distancia_km(amb.pos, Nodo(h.lat, h.lon))
-        tiempo_estimado = (distancia_directa / 60) * 60
-        match_especialidad = 1.0 if amb.especialidad in h.especialidades else 0.5
-        penalizacion_ocupacion = h.porcentaje_ocupacion() * 5
-        penalizacion_espera = h.tiempo_espera
-        costo = tiempo_estimado + penalizacion_espera + penalizacion_ocupacion + (1 - match_especialidad) * 3
-        nodos_ruta = [[amb.pos.lat, amb.pos.lon], [h.lat, h.lon]]
-        
-        return (h, nodos_ruta, costo)
-    except:
-        distancia_directa = calcular_distancia_km(amb.pos, Nodo(h.lat, h.lon))
-        tiempo_estimado = (distancia_directa / 60) * 60
-        match_especialidad = 1.0 if amb.especialidad in h.especialidades else 0.5
-        penalizacion_ocupacion = h.porcentaje_ocupacion() * 5
-        penalizacion_espera = h.tiempo_espera
-        costo = tiempo_estimado + penalizacion_espera + penalizacion_ocupacion + (1 - match_especialidad) * 3
-        nodos_ruta = [[amb.pos.lat, amb.pos.lon], [h.lat, h.lon]]
-        return (h, nodos_ruta, costo)
+    # Intentar obtener ruta real con múltiples intentos
+    # NUNCA usar línea recta - solo rutas reales que sigan las carreteras
+    
+    servicios = [
+        obtener_ruta_openrouteservice,
+        obtener_ruta_graphhopper,
+        obtener_ruta_osrm
+    ]
+    
+    # Primero intentar con caché
+    for intento in range(2):
+        try:
+            nodos_ruta, distancia_real, tiempo_base = obtener_ruta_real(amb.pos, Nodo(h.lat, h.lon))
+            
+            if nodos_ruta and len(nodos_ruta) > 2 and tiempo_base is not None and tiempo_base > 0:
+                costo = calcular_costo_ruta(amb, h, nodos_ruta, tiempo_base)
+                if costo is not None and costo > 0:
+                    return (h, nodos_ruta, costo)
+        except Exception:
+            if intento < 1:
+                time.sleep(0.2)
+            continue
+    
+    # Si el caché no funcionó, intentar directamente con cada servicio
+    # Intentar cada servicio hasta 2 veces
+    for servicio in servicios:
+        for intento_servicio in range(2):
+            try:
+                nodos_ruta, distancia_real, tiempo_base = servicio(amb.pos, Nodo(h.lat, h.lon))
+                if nodos_ruta and len(nodos_ruta) > 2 and tiempo_base is not None and tiempo_base > 0:
+                    costo = calcular_costo_ruta(amb, h, nodos_ruta, tiempo_base)
+                    if costo is not None and costo > 0:
+                        # Guardar en caché para futuras consultas
+                        _guardar_en_cache(amb.pos, Nodo(h.lat, h.lon), (nodos_ruta, distancia_real, tiempo_base))
+                        return (h, nodos_ruta, costo)
+            except Exception:
+                if intento_servicio < 1:
+                    time.sleep(0.2)
+                continue
+    
+    # Si después de todos los intentos no se obtuvo una ruta real,
+    # retornar None para que este hospital no sea considerado
+    # NO usar línea recta - los vehículos deben seguir las carreteras
+    return None
 
 # ----- CONVERSORES A JSON -----
 def ambulancia_to_dict(a):
@@ -332,8 +358,12 @@ def asignar_hospitales_dijkstra(ambulancias, hospitales):
             
             for future in as_completed(futures):
                 try:
-                    h, nodos_ruta, costo = future.result()
-                    if nodos_ruta and len(nodos_ruta) >= 2 and costo is not None and costo < mejor_costo:
+                    resultado = future.result()
+                    if resultado is None:
+                        continue
+                    h, nodos_ruta, costo = resultado
+                    # Solo aceptar rutas con más de 2 nodos (rutas reales que siguen carreteras)
+                    if nodos_ruta and len(nodos_ruta) > 2 and costo is not None and costo < mejor_costo:
                         mejor_costo = costo
                         mejor_h = h
                         mejor_ruta_nodos = nodos_ruta
@@ -384,7 +414,8 @@ def simular_ambulancia(amb):
             grafo_info = []
 
             for amb_id, (h, ruta, costo) in asignaciones.items():
-                if not ruta or not ruta.nodos or len(ruta.nodos) < 2:
+                # Solo enviar rutas con más de 2 nodos (rutas reales que siguen carreteras)
+                if not ruta or not ruta.nodos or len(ruta.nodos) <= 2:
                     continue
                     
                 color = colores[hash(amb_id) % len(colores)]
@@ -397,7 +428,7 @@ def simular_ambulancia(amb):
                 })
                 
                 origen_amb = next((a for a in ambulancias if a.id == amb_id), None)
-                if origen_amb and ruta.nodos and len(ruta.nodos) >= 2:
+                if origen_amb and ruta.nodos and len(ruta.nodos) > 2:
                     grafo_info.append({
                         "origen": {"lat": origen_amb.pos.lat, "lon": origen_amb.pos.lon, "id": amb_id},
                         "destino": {"lat": h.lat, "lon": h.lon, "id": h.nombre},

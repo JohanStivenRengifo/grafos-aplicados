@@ -254,28 +254,70 @@ socket.on("update_grafo", grafoData => {
         return;
     }
     
-    grafoData.forEach(g => {
-        if (g.ruta && Array.isArray(g.ruta) && g.ruta.length > 1) {
-            try {
-                L.polyline(g.ruta, {
-                    color: g.color || 'red',
-                    weight: 4,
-                    opacity: 0.7
-                }).addTo(grafoLayer);
+    const dibujarGrafo = (g, nodosRuta) => {
+        if (!nodosRuta || nodosRuta.length < 2) {
+            return;
+        }
+        
+        try {
+            L.polyline(nodosRuta, {
+                color: g.color || 'red',
+                weight: 4,
+                opacity: 0.7
+            }).addTo(grafoLayer);
+            
+            if (g.origen && g.destino) {
+                L.marker([g.origen.lat, g.origen.lon], {
+                    icon: iconAmb,
+                    zIndexOffset: 1000
+                }).addTo(grafoLayer).bindPopup(`Origen: ${g.origen.id}`);
                 
-                if (g.origen && g.destino) {
-                    L.marker([g.origen.lat, g.origen.lon], {
-                        icon: iconAmb,
-                        zIndexOffset: 1000
-                    }).addTo(grafoLayer).bindPopup(`Origen: ${g.origen.id}`);
-                    
-                    L.marker([g.destino.lat, g.destino.lon], {
-                        icon: iconHos,
-                        zIndexOffset: 1000
-                    }).addTo(grafoLayer).bindPopup(`Destino: ${g.destino.id}`);
+                L.marker([g.destino.lat, g.destino.lon], {
+                    icon: iconHos,
+                    zIndexOffset: 1000
+                }).addTo(grafoLayer).bindPopup(`Destino: ${g.destino.id}`);
+            }
+        } catch (error) {
+            console.error("Error dibujando grafo:", error);
+        }
+    };
+    
+    grafoData.forEach(g => {
+        if (g.ruta && Array.isArray(g.ruta) && g.ruta.length > 1 && g.origen && g.destino) {
+            // SIEMPRE intentar obtener ruta detallada para asegurar que sigue las carreteras
+            // Incluso si ya tiene más de 2 nodos, verificar que sea una ruta real completa
+            const claveGrafo = `grafo-${g.origen.id}-${g.destino.id}`;
+            
+            // Si la ruta tiene solo 2 nodos o parece simplificada, obtener ruta detallada
+            if (g.ruta.length <= 2 || (g.ruta.length > 2 && g.ruta.length < 10)) {
+                if (!rutasPendientes.has(claveGrafo)) {
+                    rutasPendientes.add(claveGrafo);
+                    obtenerRutaDetallada(
+                        [g.origen.lon, g.origen.lat],
+                        [g.destino.lon, g.destino.lat],
+                        (coords, distancia, tiempo) => {
+                            rutasPendientes.delete(claveGrafo);
+                            if (coords && coords.length > 2) {
+                                // Usar la ruta detallada que sigue las carreteras
+                                dibujarGrafo(g, coords);
+                            } else {
+                                // Si falla obtener ruta detallada y la original tiene más de 2 nodos, usarla
+                                if (g.ruta.length > 2) {
+                                    dibujarGrafo(g, g.ruta);
+                                }
+                                // Si tiene solo 2 nodos y falla, no dibujar nada (no queremos líneas rectas)
+                            }
+                        }
+                    );
+                } else {
+                    // Si ya está pendiente, esperar o usar la ruta original si tiene más de 2 nodos
+                    if (g.ruta.length > 2) {
+                        dibujarGrafo(g, g.ruta);
+                    }
                 }
-            } catch (error) {
-                console.error("Error dibujando grafo:", error);
+            } else {
+                // Si la ruta tiene muchos nodos (probablemente real), dibujarla directamente
+                dibujarGrafo(g, g.ruta);
             }
         }
     });
