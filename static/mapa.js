@@ -284,41 +284,35 @@ socket.on("update_grafo", grafoData => {
     
     grafoData.forEach(g => {
         if (g.ruta && Array.isArray(g.ruta) && g.ruta.length > 1 && g.origen && g.destino) {
-            // SIEMPRE intentar obtener ruta detallada para asegurar que sigue las carreteras
-            // Incluso si ya tiene más de 2 nodos, verificar que sea una ruta real completa
-            const claveGrafo = `grafo-${g.origen.id}-${g.destino.id}`;
-            
-            // Si la ruta tiene solo 2 nodos o parece simplificada, obtener ruta detallada
-            if (g.ruta.length <= 2 || (g.ruta.length > 2 && g.ruta.length < 10)) {
+            // El grafo viene del servidor con la ruta calculada usando Dijkstra
+            // Siempre dibujar la ruta del grafo si tiene más de 2 nodos (sigue las carreteras)
+            if (g.ruta.length > 2) {
+                // Dibujar directamente la ruta del grafo calculada con Dijkstra
+                console.log(`Dibujando grafo: ${g.origen.id} -> ${g.destino.id}, nodos: ${g.ruta.length}`);
+                dibujarGrafo(g, g.ruta);
+            } else if (g.ruta.length === 2) {
+                // Si tiene solo 2 nodos (línea recta), intentar obtener ruta detallada
+                const claveGrafo = `grafo-${g.origen.id}-${g.destino.id}`;
                 if (!rutasPendientes.has(claveGrafo)) {
                     rutasPendientes.add(claveGrafo);
+                    console.log(`Obteniendo ruta detallada para grafo: ${g.origen.id} -> ${g.destino.id}`);
                     obtenerRutaDetallada(
                         [g.origen.lon, g.origen.lat],
                         [g.destino.lon, g.destino.lat],
                         (coords, distancia, tiempo) => {
                             rutasPendientes.delete(claveGrafo);
                             if (coords && coords.length > 2) {
-                                // Usar la ruta detallada que sigue las carreteras
+                                console.log(`Ruta detallada obtenida: ${coords.length} nodos`);
                                 dibujarGrafo(g, coords);
                             } else {
-                                // Si falla obtener ruta detallada y la original tiene más de 2 nodos, usarla
-                                if (g.ruta.length > 2) {
-                                    dibujarGrafo(g, g.ruta);
-                                }
-                                // Si tiene solo 2 nodos y falla, no dibujar nada (no queremos líneas rectas)
+                                console.warn(`No se pudo obtener ruta detallada para ${g.origen.id} -> ${g.destino.id}`);
                             }
                         }
                     );
-                } else {
-                    // Si ya está pendiente, esperar o usar la ruta original si tiene más de 2 nodos
-                    if (g.ruta.length > 2) {
-                        dibujarGrafo(g, g.ruta);
-                    }
                 }
-            } else {
-                // Si la ruta tiene muchos nodos (probablemente real), dibujarla directamente
-                dibujarGrafo(g, g.ruta);
             }
+        } else {
+            console.warn('Grafo inválido:', g);
         }
     });
 });

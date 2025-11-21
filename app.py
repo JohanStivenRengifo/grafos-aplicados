@@ -5,7 +5,8 @@ from collections import OrderedDict
 try:
     from flask import Flask, render_template, Response
     from flask_socketio import SocketIO
-    from clases import Nodo, Hospital, Ruta, Ambulancia, Via
+    from clases import (Nodo, Hospital, Ruta, Ambulancia, Via, 
+                       ListaEnlazada, ArbolBinarioBusqueda, Grafo)
     import requests
     import threading
     import time
@@ -349,9 +350,8 @@ def asignar_hospitales_dijkstra(ambulancias, hospitales):
         if not hospitales_disponibles:
             continue
         
-        mejor_h = None
-        mejor_costo = float('inf')
-        mejor_ruta_nodos = None
+        # Usar Árbol Binario de Búsqueda para organizar hospitales por costo
+        arbol_hospitales = ArbolBinarioBusqueda()
         
         with ThreadPoolExecutor(max_workers=min(len(hospitales_disponibles), 6)) as executor:
             futures = {executor.submit(evaluar_hospital, amb, h): h for h in hospitales_disponibles}
@@ -363,17 +363,63 @@ def asignar_hospitales_dijkstra(ambulancias, hospitales):
                         continue
                     h, nodos_ruta, costo = resultado
                     # Solo aceptar rutas con más de 2 nodos (rutas reales que siguen carreteras)
-                    if nodos_ruta and len(nodos_ruta) > 2 and costo is not None and costo < mejor_costo:
-                        mejor_costo = costo
-                        mejor_h = h
-                        mejor_ruta_nodos = nodos_ruta
+                    if nodos_ruta and len(nodos_ruta) > 2 and costo is not None:
+                        # Insertar en el árbol binario ordenado por costo
+                        arbol_hospitales.insertar((h, nodos_ruta), costo)
                 except:
                     continue
         
-        if mejor_h and mejor_ruta_nodos and len(mejor_ruta_nodos) >= 2:
-            ruta = Ruta(mejor_ruta_nodos, round(mejor_costo, 1))
-            asignaciones[amb.id] = (mejor_h, ruta, round(mejor_costo, 1))
-            hospitales_usados.add(mejor_h.nombre)
+                # Obtener el hospital con menor costo del árbol
+        if not arbol_hospitales.esta_vacio():
+            mejor_resultado, mejor_costo = arbol_hospitales.obtener_menor()
+            if mejor_resultado:
+                mejor_h, mejor_ruta_nodos = mejor_resultado
+                
+                # Construir grafo desde la ruta y aplicar Dijkstra
+                # Calcular distancia total de la ruta sumando distancias entre nodos consecutivos
+                distancia_total_ruta = 0
+                for i in range(len(mejor_ruta_nodos) - 1):
+                    distancia_total_ruta += calcular_distancia_km(
+                        Nodo(mejor_ruta_nodos[i][0], mejor_ruta_nodos[i][1]),
+                        Nodo(mejor_ruta_nodos[i+1][0], mejor_ruta_nodos[i+1][1])
+                    )
+                
+                # Construir el grafo y aplicar Dijkstra
+                grafo = Grafo()
+                distancia_grafo, camino_grafo, tiempo_grafo = grafo.construir_grafo_desde_ruta(
+                    mejor_ruta_nodos,
+                    distancia_total_ruta if distancia_total_ruta > 0 else calcular_distancia_km(amb.pos, Nodo(mejor_h.lat, mejor_h.lon)),
+                    amb.id,
+                    mejor_h.nombre,
+                    amb.pos.lat,
+                    amb.pos.lon,
+                    mejor_h.lat,
+                    mejor_h.lon
+                )
+                
+                # Usar la ruta del grafo (resultado de Dijkstra) si está disponible y es válida
+                # Si el grafo no devuelve una ruta válida, usar la ruta original de la API
+                if camino_grafo and len(camino_grafo) > 2:
+                    ruta_final = camino_grafo
+                    print(f"[GRAFO] {amb.id} -> {mejor_h.nombre}: Usando ruta del grafo con {len(camino_grafo)} nodos")
+                else:
+                    # Si el grafo no devuelve ruta válida, usar la original
+                    ruta_final = mejor_ruta_nodos
+                    print(f"[GRAFO] {amb.id} -> {mejor_h.nombre}: Usando ruta original con {len(mejor_ruta_nodos)} nodos (grafo falló)")
+                
+                if ruta_final and len(ruta_final) > 2:
+                    ruta = Ruta(ruta_final, round(mejor_costo, 1))
+                    asignaciones[amb.id] = (mejor_h, ruta, round(mejor_costo, 1))
+                    hospitales_usados.add(mejor_h.nombre)
+                    
+                    # Guardar en historial de la ambulancia usando ListaEnlazada
+                    amb.historial.agregar_final({
+                        "hospital": mejor_h.nombre,
+                        "tiempo": round(mejor_costo, 1),
+                        "timestamp": time.time(),
+                        "ruta": ruta_final,
+                        "distancia": distancia_total_ruta if distancia_total_ruta > 0 else distancia_grafo
+                    })
     
     return asignaciones
 
@@ -410,12 +456,14 @@ def simular_ambulancia(amb):
             actualizar_estado_hospitales()
             
             asignaciones = asignar_hospitales_dijkstra(ambulancias, hospitales)
+            print(f"[SIMULACION] Asignaciones obtenidas: {len(asignaciones)}")
             rutas_info = []
             grafo_info = []
 
             for amb_id, (h, ruta, costo) in asignaciones.items():
                 # Solo enviar rutas con más de 2 nodos (rutas reales que siguen carreteras)
                 if not ruta or not ruta.nodos or len(ruta.nodos) <= 2:
+                    print(f"[SIMULACION] Saltando {amb_id} -> {h.nombre}: ruta inválida o muy corta")
                     continue
                     
                 color = colores[hash(amb_id) % len(colores)]
@@ -435,11 +483,16 @@ def simular_ambulancia(amb):
                         "ruta": ruta.nodos,
                         "color": color
                     })
+                    print(f"[GRAFO] Enviando grafo: {amb_id} -> {h.nombre} con {len(ruta.nodos)} nodos")
 
             if rutas_info:
+                print(f"[SIMULACION] Enviando {len(rutas_info)} rutas al cliente")
                 socketio.emit("update_rutas", rutas_info)
             if grafo_info:
+                print(f"[GRAFO] Enviando {len(grafo_info)} grafos al cliente")
                 socketio.emit("update_grafo", grafo_info)
+            else:
+                print(f"[GRAFO] No hay grafos para enviar")
             
             if amb.id in asignaciones:
                 h, ruta, _ = asignaciones[amb.id]
