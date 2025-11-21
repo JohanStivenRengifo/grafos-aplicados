@@ -344,25 +344,11 @@ python app.py
 
 Luego abre tu navegador en `http://127.0.0.1:5000`
 
-## 🔧 Tecnologías Utilizadas
 
-- **Backend**: Flask, Flask-SocketIO
-- **Frontend**: Leaflet.js, Socket.IO
-- **APIs de Routing**: OpenRouteService, GraphHopper, OSRM
-- **Estructuras de Datos**: Listas Enlazadas, Árboles Binarios, Grafos
-- **Algoritmos**: Dijkstra para búsqueda de caminos
-
-## 📈 Características Principales
-
-1. **Rutas Reales**: Las rutas siguen las carreteras reales, no líneas rectas
-2. **Optimización Multi-criterio**: Considera tiempo, distancia, especialidad y capacidad
-3. **Visualización en Tiempo Real**: Actualizaciones instantáneas mediante WebSockets
-4. **Estructuras de Datos Avanzadas**: Implementación completa de listas, árboles y grafos
-5. **Algoritmo de Dijkstra**: Optimización de rutas usando grafos
-
-## 📝 Autor
+## 📝 Autores
 
 Johan Stiven Rengifo
+Tatiana Muñoz Daza 
 
 ## 📄 Licencia
 
