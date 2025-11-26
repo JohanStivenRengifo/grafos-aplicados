@@ -32,8 +32,8 @@ class Via:
     def calcular_peso(self):
         if self.bloqueada:
             return float('inf')
-        tiempo_base = (self.distancia_km / 60) * 60  # minutos asumiendo 60 km/h
-        multiplicador_trafico = 1 + (self.trafico * 2)  # hasta 3x más tiempo
+        tiempo_base = (self.distancia_km / 30) * 60  # minutos asumiendo 30 km/h
+        multiplicador_trafico = 1 + (self.trafico * 1)  # hasta 1x más tiempo
         return tiempo_base * multiplicador_trafico
 
 # Especialidades ecvaluadas   
@@ -53,9 +53,8 @@ class Hospital:
     def porcentaje_ocupacion(self):
         return self.pacientes_actuales / self.capacidad_max if self.capacidad_max > 0 else 0
 
-# ===== ESTRUCTURAS DE DATOS =====
 
-# 1. LISTA ENLAZADA
+# Listas enlazadas, árboles binarios de búsqueda y grafos
 class NodoLista:
     """Nodo de una lista enlazada"""
     def __init__(self, dato):
