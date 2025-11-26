@@ -36,6 +36,7 @@ class Via:
         multiplicador_trafico = 1 + (self.trafico * 2)  # hasta 3x más tiempo
         return tiempo_base * multiplicador_trafico
 
+# Especialidades ecvaluadas   
 class Hospital:
     def __init__(self, nombre, lat, lon, tiempo_espera=0, especialidades=None, capacidad_max=10, pacientes_actuales=0):
         self.nombre = nombre

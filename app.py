@@ -246,6 +246,7 @@ def obtener_ruta_real(origen, destino):
     ]
     
     # Intentar cada servicio hasta obtener una ruta válida con más de 2 nodos
+    #Base matematica del costo minimo
     for servicio in servicios:
         try:
             nodos_ruta, distancia, tiempo = servicio(origen, destino)
